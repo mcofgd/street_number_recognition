@@ -33,29 +33,13 @@ from street_number_recognition.config.config import (
 )
 
 # 工具函数导入
-from street_number_recognition.utils.image_utils import crop_image
+from street_number_recognition.utils.image_utils import crop_image, preprocess_for_crnn, save_processed_tensor, ensure_min_width, strLabelConverter,preprocess_for_inference,get_transforms
 
 # 模型导入
 from street_number_recognition.models.yolov5.detect import run as yolov5_detect
-from street_number_recognition.models.crnn.code.test import predict as crnn_predict
+from street_number_recognition.models.crnn.code.test import predict_image as crnn_predict
+import torchvision.transforms as transforms
 
-def preprocess_for_crnn(img: np.ndarray) -> np.ndarray:
-    """CRNN专用预处理"""
-    # 转换为灰度
-    if len(img.shape) == 3:
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = img
-    
-    # 调整尺寸（保持长宽比，高度固定为32）
-    h, w = gray.shape
-    new_w = int(w * 32 / h)
-    resized = cv2.resize(gray, (new_w, 32), interpolation=cv2.INTER_CUBIC)
-    
-    # 归一化并扩展为三通道（如果模型需要）
-    normalized = resized.astype(np.float32) / 255.0
-    normalized = (normalized * 255).astype(np.uint8)
-    return cv2.merge([normalized, normalized, normalized])  # 转换为3通道
 
 def get_latest_detection_dir(output_dir: Path) -> Path:
     """获取最新的检测目录"""
@@ -141,6 +125,12 @@ def parse_yolo_detections(image_path: Path, output_dir: Path) -> List[Dict]:
     print(f"[DEBUG] 解析到 {len(detections)} 个有效检测")
     return detections
 
+
+
+from pathlib import Path
+import cv2
+import shutil
+
 def process_single_image(image_path: str, yolo_weights: str, crnn_model_path: str) -> str:
     # 初始化路径
     image_path = Path(image_path)
@@ -163,7 +153,7 @@ def process_single_image(image_path: str, yolo_weights: str, crnn_model_path: st
         print(f"YOLOv5检测失败: {str(e)}")
         return ""
 
-    # 解析结果
+    # 解析YOLO检测结果
     detections = parse_yolo_detections(image_path, output_dir)
     if not detections:
         print(f"警告: 未检测到有效目标 {image_path.name}")
@@ -173,54 +163,87 @@ def process_single_image(image_path: str, yolo_weights: str, crnn_model_path: st
     crnn_input_dir = temp_dir / "crnn_input"
     crnn_input_dir.mkdir(exist_ok=True)
     
+    from street_number_recognition.models.crnn.code.model import SimpleCharClassifier
+    # 加载CRNN模型
+    try:
+        device = torch.device('cpu')  # 或者 'cuda' 如果有GPU
+        checkpoint = torch.load(crnn_model_path, map_location=device)
+
+        # 初始化模型结构
+        model = SimpleCharClassifier(num_classes=10)
+        model = model.to(device)
+
+        # 加载权重
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)
+
+        model.eval()  # 设置为评估模式
+
+    except Exception as e:
+        print(f"模型加载失败: {e}")
+        raise
+
     # 保存预处理图像
     crnn_image_map = {}
     sorted_detections = sorted(detections, key=lambda x: x['bbox'][0])
     for i, detection in enumerate(sorted_detections):
         try:
             # 裁剪图像
-            img = cv2.imread(str(image_path))
+            img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             cropped = crop_image(img, detection['bbox'])
             
-            # 预处理并保存
-            processed = preprocess_for_crnn(cropped)
-            save_path = crnn_input_dir / f"{image_path.stem}_{i}.png"
-            cv2.imwrite(str(save_path), processed)
-            crnn_image_map[i] = save_path.name
+            # 定义推理预处理变换
+            transform = get_transforms(is_train=False)
+            # 预处理
+            processed = preprocess_for_inference(cropped, transform)  # 返回的是 (C,H,W)
             
-            # 调试输出
-            print(f"Detection {i}:")
-            print(f"  原始尺寸: {cropped.shape} -> 处理后: {processed.shape}")
-            print(f"  保存路径: {save_path}")
+            print("Input tensor shape:", processed.shape)  # 应该输出: torch.Size([1, 1, 32, W])，W >= 100
+
+            # 保存图像
+            save_path = crnn_input_dir / f"{image_path.stem}_{i}.png"
+            save_processed_tensor(processed, save_path)  # 需要修改此函数以支持保存张量为图像
+            
+            # 在保存图像的同时记录其对应的检测项索引
+            crnn_image_map[i] = {
+                "path": save_path.name,
+                "detection_index": i
+            }
+            
         except Exception as e:
             print(f"检测项 {i} 处理失败: {str(e)}")
             crnn_image_map[i] = None
-
+    
     # CRNN预测
     crnn_results = {}
     if any(crnn_image_map.values()):
-        try:
-            print(f"[CRNN] 输入目录: {crnn_input_dir}")
-            crnn_results = crnn_predict(
-                model_path=crnn_model_path,
-                test_data_dir=str(crnn_input_dir),
-                output_dir=str(temp_dir / "crnn_output"),
-                save_predictions=False
-            )
-            print(f"[CRNN] 原始结果: {crnn_results}")
-        except Exception as e:
-            print(f"CRNN预测异常: {str(e)}")
+        for info in crnn_image_map.values():
+            if info is not None:
+                try:
+                    print(f"[CRNN] 输入目录: {crnn_input_dir}")
+                    
+                    # 使用已加载好的 model 实例进行预测
+                    result = crnn_predict(model, str(crnn_input_dir / info["path"]))  # 调用 predict_image 并传入模型和图像路径
+                    
+                    # 构造结果格式
+                    crnn_results[info["detection_index"]] = {
+                        "text": result["text"],
+                        "confidence": result["confidence"]
+                    }
+
+                    print(f"[CRNN] 原始结果: '{result['text']}', 置信度: {result['confidence']:.4f}")
+                except Exception as e:
+                    print(f"CRNN预测异常: {str(e)}")
 
     # === 结果融合 ===
     final_text = ""
     for i, detection in enumerate(sorted_detections):
         yolo_text = detection['text']
         yolo_conf = detection['confidence']
-        
+
         # 获取CRNN结果
-        crnn_data = {}
-        if crnn_image_map.get(i):
-            crnn_data = crnn_results.get(crnn_image_map[i], {})
+        crnn_data = crnn_results.get(i, {})
         
         crnn_text = str(crnn_data.get('text', '')).strip()
         crnn_conf = crnn_data.get('confidence', 0.0)
@@ -254,7 +277,7 @@ def process_single_image(image_path: str, yolo_weights: str, crnn_model_path: st
         # 调试输出
         print(f"检测项 {i} 决策:")
         print(f"  YOLO: {yolo_text} (置信度 {yolo_conf:.2f})")
-        print(f"  CRNN: {crnn_text} (置信度 {crnn_conf:.2f})")
+        print(f"  CRNN: '{crnn_text}' (置信度 {crnn_conf:.2f})")
         print(f"  选择: {choice}")
 
     # 清理临时文件

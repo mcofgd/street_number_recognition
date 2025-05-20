@@ -3,45 +3,36 @@ import json
 import cv2
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from .model import SimpleCharClassifier
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
-import argparse
-from street_number_recognition.models.crnn.code.model import CRNN  # 绝对导入路径
-from street_number_recognition.utils.image_utils import strLabelConverter, resizeNormalize  # 绝对导入路径
-#from street_number_recognition.data_loader.data_loader import get_transforms  # 绝对导入路径
 
 def check_image_quality(image):
     """
     检查图像质量
     返回: (bool, str) - (是否通过检查, 失败原因)
     """
-    # 检查图像是否为空
     if image is None:
         return False, "图像读取失败"
     
-    # 检查图像尺寸
     h, w = image.shape[:2]
-    if h < 16 or w < 16:  # 降低最小尺寸要求
+    if h < 16 or w < 16:
         return False, f"图像尺寸过小: {h}x{w}"
     
-    # 检查图像是否模糊
     gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     laplacian = cv2.Laplacian(gray, cv2.CV_64F).var()
-    if laplacian < 30:  # 降低模糊检测阈值
+    if laplacian < 30:
         return False, f"图像模糊: {laplacian:.2f}"
     
-    # 检查图像亮度
     brightness = np.mean(gray)
-    if brightness < 20:  # 降低暗度阈值
+    if brightness < 20:
         return False, f"图像过暗: {brightness:.2f}"
-    if brightness > 230:  # 提高亮度阈值
+    if brightness > 230:
         return False, f"图像过亮: {brightness:.2f}"
     
-    # 检查图像对比度
     contrast = np.std(gray)
-    if contrast < 20:  # 添加对比度检查
+    if contrast < 20:
         return False, f"图像对比度过低: {contrast:.2f}"
     
     return True, "图像质量正常"
@@ -65,276 +56,137 @@ def preprocess_image(image):
     brightness = np.mean(gray)
     contrast = np.std(gray)
     
-    # 如果图像过暗
     if brightness < 20:
-        alpha = 1.5  # 增加亮度
-        beta = 30    # 增加偏移
+        alpha = 1.5
+        beta = 30
         image = cv2.convertScaleAbs(image, alpha=alpha, beta=beta)
-    # 如果图像过亮
     elif brightness > 230:
-        alpha = 0.8  # 降低亮度
+        alpha = 0.8
         image = cv2.convertScaleAbs(image, alpha=alpha, beta=0)
     
-    # 如果对比度过低
     if contrast < 20:
-        # 使用直方图均衡化
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         gray = cv2.equalizeHist(gray)
         image = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
     
     return image
 
-class TestDataset(Dataset):
-    def __init__(self, data_dir, transform=None, max_samples=None):
-        self.data_dir = data_dir
-        self.transform = transform
-        # 获取所有图片文件并按数字顺序排序
-        self.image_files = []
-        for f in os.listdir(data_dir):
-            if f.endswith('.png') or f.endswith('.jpg'):
-                try:
-                    # 验证文件名格式
-                    num = int(f.split('.')[0])
-                    self.image_files.append(f)
-                except ValueError:
-                    print(f"警告：跳过无效的文件名 {f}")
-                    continue
-        self.image_files.sort(key=lambda x: int(x.split('.')[0]))
-        
-        if max_samples is not None:
-            self.image_files = self.image_files[:max_samples]
-        
-        # 创建debug目录
-        self.debug_dir = os.path.join(os.path.dirname(data_dir), 'debug_images')
-        os.makedirs(self.debug_dir, exist_ok=True)
-        
-        # 打印加载的图片数量
-        print(f"成功加载 {len(self.image_files)} 张图片")
-    
-    def __len__(self):
-        return len(self.image_files)
-    
-    def __getitem__(self, idx):
-        img_name = self.image_files[idx]
-        img_path = os.path.join(self.data_dir, img_name)
-        
-        try:
-            # 读取图像
-            image = cv2.imread(img_path)
-            if image is None:
-                print(f"警告：无法读取图像 {img_name}")
-                # 返回一个占位图像
-                image = np.zeros((128, 384, 3), dtype=np.uint8)
-                return image, img_name, (128, 384), False
-            
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            # 预处理图像
-            image = preprocess_image(image)
-            if image is None:
-                print(f"警告：图像 {img_name} 预处理失败")
-                image = np.zeros((128, 384, 3), dtype=np.uint8)
-                return image, img_name, (128, 384), False
-            
-            # 保存原始图像尺寸
-            orig_h, orig_w = image.shape[:2]
-            
-            # 检查图像质量
-            is_valid, reason = check_image_quality(image)
-            if not is_valid:
-                print(f"警告：图像 {img_name} 质量检查未通过 - {reason}")
-                # 保存问题图像用于调试
-                debug_path = os.path.join(self.debug_dir, f"invalid_{img_name}")
-                cv2.imwrite(debug_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-                # 尝试再次预处理
-                image = preprocess_image(image)
-                if image is not None:
-                    is_valid, _ = check_image_quality(image)
-            
-            # 应用变换
-            if self.transform:
-                transformed = self.transform(image=image)
-                image = transformed['image']
-            
-            return image, img_name, (orig_h, orig_w), is_valid
-            
-        except Exception as e:
-            print(f"处理图像 {img_name} 时出错: {str(e)}")
-            # 返回一个占位图像
-            image = np.zeros((128, 384, 3), dtype=np.uint8)
-            return image, img_name, (128, 384), False
-
-class strLabelConverter:
-    """修正后的标签转换器"""
-    def __init__(self, alphabet):
-        self.alphabet = alphabet  # 字符集（如'0123456789'）
-        self.blank = len(alphabet)  # 空白标签索引
-    
-    def decode(self, preds):
-        """解码模型输出（支持批量处理）
-        输入形状: (seq_len, batch_size)
-        返回: 解码后的字符串列表
-        """
-        texts = []
-        for i in range(preds.size(1)):  # 遍历批次
-            char_indices = []
-            previous = self.blank  # 初始化前一个字符为空白
-            for t in range(preds.size(0)):  # 遍历序列
-                current = preds[t, i].item()
-                if current != previous and current != self.blank:
-                    char_indices.append(current)
-                previous = current
-            text = ''.join([self.alphabet[idx] for idx in char_indices if idx < len(self.alphabet)])
-            texts.append(text)
-        return texts
-
-def decode_predictions(logits, converter):
-    """带置信度计算的解码函数"""
-    # 输入形状: (seq_len, batch_size, num_classes)
-    probs = torch.nn.functional.softmax(logits, dim=2)
-    max_probs, max_indices = torch.max(probs, dim=2)
-    
-    batch_texts = []
-    batch_confidences = []
-    
-    for i in range(max_indices.size(1)):  # 遍历批次
-        # 解码文本
-        preds = max_indices[:, i]
-        text = converter.decode(preds.unsqueeze(1))[0]  # 保持维度
-        
-        # 计算置信度
-        valid_probs = []
-        previous = converter.blank
-        for t in range(preds.size(0)):
-            current = preds[t].item()
-            if current != previous and current != converter.blank:
-                valid_probs.append(max_probs[t, i].item())
-            previous = current
-        
-        confidence = np.mean(valid_probs) if valid_probs else 0.0
-        confidence = round(confidence, 4)
-        
-        batch_texts.append(text)
-        batch_confidences.append(confidence)
-    
-    return batch_texts, batch_confidences
-
-def predict(
-    model_path: str, 
-    test_data_dir: str, 
-    output_dir: str,
-    batch_size: int = 8,
-    save_predictions: bool = True
-) -> dict:
-    # 设备配置
+def load_model(model_path='../user_data/model_data/best_model.pth'):
+    """
+    加载训练好的模型
+    Args:
+        model_path: 模型文件路径
+    Returns:
+        加载好的模型
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 数据转换
-    transform = A.Compose([
-        A.Resize(height=32, width=100),  # 根据模型输入尺寸调整
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-
-    # 加载数据
-    test_dataset = TestDataset(test_data_dir, transform)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        collate_fn=lambda x: (
-            torch.stack([item[0] for item in x]),
-            [item[1] for item in x],
-            [item[2] for item in x],
-            torch.tensor([item[3] for item in x])
-        )
-    )
-
-    # 正确初始化模型（参数与model.py定义一致）
-    model = CRNN(
-        num_classes=11,         # 实际类别数+1（包含空白标签）
-        rnn_hidden_size=256     # 与训练时保持一致
-    )
-
+    model = SimpleCharClassifier(num_classes=10)  # 0-9数字分类
+    
     try:
-        # 加载检查点并处理多GPU训练权重
         checkpoint = torch.load(model_path, map_location=device)
-        
-        # 移除可能的"module."前缀（如果是多GPU训练保存的）
-        state_dict = {k.replace('module.', ''): v 
-                    for k, v in checkpoint['model_state_dict'].items()}
-        
-        # 加载权重并验证
-        model.load_state_dict(state_dict)
+        model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         model.eval()
-        
-        # 打印验证信息
-        print("成功加载模型参数！")
-        print(f"输入示例形状: {torch.randn(1,3,32,100).shape}")  # 验证输入尺寸
-        print(f"输出示例形状: {model(torch.randn(1,3,32,100).shape)}")  # 验证输出
-        
+        print(f"成功加载模型，验证损失: {checkpoint['val_loss']:.4f}, 验证准确率: {checkpoint['val_acc']:.4f}")
+        return model
     except Exception as e:
-        raise RuntimeError(f"模型加载失败: {str(e)}\n"
-                         "可能原因：\n"
-                         "1. 模型定义与检查点不匹配\n"
-                         "2. 输入尺寸不一致\n"
-                         "3. 类别数设置错误")
+        print(f"加载模型时出错: {str(e)}")
+        return None
 
-    # 初始化转换器
-    converter = strLabelConverter(alphabet='0123456789')
+from .data_loader import get_transforms
 
-    predictions = {}
+def predict_image(model, image_path):
+    """
+    预测单张图像（适配CRNN输入格式）
+    Args:
+        model: 加载好的模型
+        image_path: 图像文件路径
+    Returns:
+        dict: 包含预测结果和置信度
+    """
+    if model is None:
+        return {'text': '', 'confidence': 0.0, 'success': False}
+
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        return {'text': '', 'confidence': 0.0, 'success': False}
+
+    # 读取图像为三通道
+    image = cv2.imread(image_path, cv2.IMREAD_COLOR)  # 强制三通道
+    if image is None:
+        print(f"无法读取图像: {image_path}")
+        return {'text': '', 'confidence': 0.0, 'success': False}
+
+    # 转换为 RGB 格式（如果模型训练时用了 RGB）
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    # 应用与训练时一致的预处理（包括归一化）
+    transform = get_transforms(is_train=False)  # 使用与训练相同的 transforms
+    transformed = transform(image=image)
+    image_tensor = transformed['image']  # shape: [C, H, W]
+    image_tensor = image_tensor.unsqueeze(0).to(device)  # shape: [1, C, H, W]
+
+    # 推理
     with torch.no_grad():
-        for batch_idx, (images, img_names, orig_sizes, is_valid) in enumerate(tqdm(test_loader, desc="Predicting")):
-            try:
-                images = images.to(device)
-                
-                # 前向传播
-                logits = model(images)  # 形状: (seq_len, batch_size, nclass)
-                
-                # 解码预测
-                batch_texts, batch_confidences = decode_predictions(logits, converter)
-                
-                # 保存结果
-                for i, img_name in enumerate(img_names):
-                    predictions[img_name] = {
-                        "text": batch_texts[i],
-                        "confidence": batch_confidences[i]
-                    }
-
-            except Exception as e:
-                print(f"批次 {batch_idx} 处理失败: {str(e)}")
-                # 填充默认值
-                for img_name in img_names:
-                    predictions[img_name] = {"text": "", "confidence": 0.0}
-
-    # 保存结果
-    if save_predictions:
-        output_path = os.path.join(output_dir, "predictions.json")
-        with open(output_path, 'w') as f:
-            json.dump(predictions, f, indent=2, ensure_ascii=False)
-        print(f"结果已保存至 {output_path}")
+        logits, confidence, predicted = model(image_tensor)
+        pred_class = str(predicted.item())
+        conf = confidence.item()
+        print(f"Logits: {logits}")
+        print(f"Confidence: {confidence}")
+        return {
+            'text': pred_class,
+            'confidence': conf,
+            'success': True
+        }
     
-    return predictions
-# ---------------------- 命令行接口 ----------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, required=True)
-    parser.add_argument('--test_data_dir', type=str, required=True)
-    parser.add_argument('--output_dir', type=str, required=True)
-    parser.add_argument('--batch_size', type=int, default=8)
-    args = parser.parse_args()
+def predict_batch(model, image_dir, output_dir):
+    """
+    批量预测图像
+    Args:
+        model: 加载好的模型
+        image_dir: 图像目录
+        output_dir: 输出目录
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     
-    predict(
-        model_path=args.model,
-        test_data_dir=args.test_data_dir,
-        output_dir=args.output_dir,
-        batch_size=args.batch_size
-    )
+    # 获取所有图片文件
+    image_files = [f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg'))]
+    
+    results = []
+    for img_name in tqdm(image_files, desc="处理图像"):
+        img_path = os.path.join(image_dir, img_name)
+        result = predict_image(model, img_path)
+        
+        if result and result['success']:
+            results.append({
+                'image': img_name,
+                'prediction': result['prediction'],
+                'confidence': result['confidence']
+            })
+    
+    # 保存预测结果
+    output_file = os.path.join(output_dir, 'predictions.json')
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    
+    print(f"预测完成，结果已保存到: {output_file}")
 
+def main():
+    # 配置
+    model_path = '../user_data/model_data/best_model.pth'
+    test_data_dir = '../user_data/test_data'
+    output_dir = '../user_data/predictions'
+    
+    # 加载模型
+    model = load_model(model_path)
+    if model is None:
+        print("模型加载失败，程序退出")
+        return
+    
+    # 执行预测
+    predict_batch(model, test_data_dir, output_dir)
 
-
-# 以上代码是一个完整的CRNN模型预测脚本，包含了图像预处理、数据加载、模型加载和预测等功能。
+if __name__ == '__main__':
+    main()

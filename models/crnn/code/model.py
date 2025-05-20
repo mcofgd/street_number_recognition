@@ -1,51 +1,62 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
+import torch.nn.functional as F
+import torchvision
 
-class CRNN(nn.Module):
-    def __init__(self, num_classes=11, rnn_hidden_size=256):
-        super(CRNN, self).__init__()
-        
-        # 使用ResNet18作为骨干网络，提取特征
-        resnet = models.resnet18(pretrained=True)
-        self.conv_layers = nn.Sequential(*list(resnet.children())[:-2])  # 移除最后两层
-        
-        # 自适应池化层，将特征图高度固定为1
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, None))
-        
-        # BiLSTM层
-        self.rnn = nn.LSTM(
-            input_size=512,          # ResNet18的最后一个卷积层输出通道数
-            hidden_size=rnn_hidden_size,
-            bidirectional=True,
-            num_layers=2,
-            dropout=0.5,
-            batch_first=True
+
+def print_tensor_stats(name, tensor):
+    """打印张量的统计信息"""
+    if not torch.isfinite(tensor).all():
+        print(f"[ERROR] {name} contains NaN or Inf")
+
+    if torch.is_floating_point(tensor):
+        print(f"{name} stats: min={tensor.min().item():.4f}, "
+              f"max={tensor.max().item():.4f}, "
+              f"mean={tensor.mean().item():.4f}")
+    else:
+        print(f"{name} is not a floating-point tensor, skipping mean calculation.")
+
+
+class SimpleCharClassifier(nn.Module):
+    def __init__(self, num_classes=10):  # 注意这里去掉了blank类
+        super(SimpleCharClassifier, self).__init__()
+
+        # 使用 ResNet18 作为骨干网络
+        resnet = torchvision.models.resnet18(pretrained=True)
+
+        # 替换最后两层（去掉 avgpool 和 fc）
+        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+
+        # 自定义全局平均池化
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # 分类头
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(512, num_classes),
         )
-        
-        # 分类层
-        self.fc = nn.Linear(rnn_hidden_size * 2, num_classes)  # 双向LSTM的输出通道数为hidden_size*2
-    
+
+        # 初始化分类层
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
-        # 卷积层提取特征
-        features = self.conv_layers(x)  # 输出形状: (batch_size, 512, H, W)
-        
-        # 自适应池化，将H变为1
-        pooled_features = self.adaptive_pool(features)  # 输出形状: (batch_size, 512, 1, W)
-        pooled_features = pooled_features.squeeze(2)  # 输出形状: (batch_size, 512, W)
-        
-        # 调整形状以适应RNN输入
-        pooled_features = pooled_features.permute(2, 0, 1)  # 输出形状: (W, batch_size, 512)
-        
-        # LSTM层
-        lstm_out, _ = self.rnn(pooled_features)  # 输出形状: (W, batch_size, rnn_hidden_size*2)
-        
-        # 分类层
-        logits = self.fc(lstm_out)  # 输出形状: (W, batch_size, num_classes)
-        
-        return logits
+        """
+        :param x: shape [B, C, H, W]
+        :return: logits [B, num_classes]
+        """
+        features = self.backbone(x)  # [B, 512, H', W']
+        pooled = self.global_pool(features)  # [B, 512, 1, 1]
+        logits = self.classifier(pooled)  # [B, num_classes]
 
+        # 检查点
+        print_tensor_stats("CNN特征", features)
+        print_tensor_stats("分类logits", logits)
 
+        probs = F.softmax(logits, dim=1)
+        confidence, predicted = torch.max(probs, dim=1)
 
-
-
+        return logits, confidence, predicted
+    
