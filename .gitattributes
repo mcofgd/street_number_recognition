@@ -118,3 +118,6 @@
 
 *.pkl filter=lfs diff=lfs merge=lfs -text
 *.pickle filter=lfs diff=lfs merge=lfs -text
+
+*.csv
+data/
