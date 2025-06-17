@@ -141,6 +141,7 @@ def process_single_image(image_path: str, yolo_weights: str, crnn_model_path: st
     # === YOLO检测 ===
     print(f"\n=== 处理图像: {image_path} ===")
     try:
+        
         yolov5_detect(
             weights=yolo_weights,
             source=str(image_path),
@@ -149,6 +150,24 @@ def process_single_image(image_path: str, yolo_weights: str, crnn_model_path: st
             save_txt=True,
             save_conf=True
         )
+        '''
+        from ultralytics import YOLO
+       
+        # 加载模型
+        yolo_model = YOLO(yolo_weights)  # 支持 .pt / .onnx / 等格式
+
+        # 推理
+        results = yolo_model.predict(
+            source=str(image_path),
+            project=str(output_dir),
+            name='detections',
+            save=True,        # 保存图像
+            save_txt=True,    # 保存标签文件
+            save_conf=True,   # 保存置信度
+            conf=0.5         # 可选：置信度阈值
+        )
+        '''
+        
     except Exception as e:
         print(f"YOLOv5检测失败: {str(e)}")
         return ""
@@ -264,8 +283,10 @@ def process_single_image(image_path: str, yolo_weights: str, crnn_model_path: st
                 final_text += yolo_text
             else:
                 # 加权评分
-                total_score = yolo_conf * 0.7 + crnn_conf * 0.3
-                choice = "YOLO" if total_score > 0.6 else "CRNN"
+                total_score = yolo_conf * 0.6 + crnn_conf * 0.4
+                 # 动态阈值
+                threshold = 0.65 if crnn_conf > 0.8 else 0.55
+                choice = "YOLO" if total_score > threshold else "CRNN"
                 final_text += yolo_text if choice == "YOLO" else crnn_text
         elif valid_yolo:
             choice = "YOLO有效"

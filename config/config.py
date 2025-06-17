@@ -6,12 +6,14 @@ ROOT_DIR = Path(__file__).parent.parent
 
 # 模型路径
 MODEL_DIR = ROOT_DIR / "models"
-YOLOV5_WEIGHTS = MODEL_DIR / "yolov5" / "weights" / "best.pt"
+#YOLOV5_WEIGHTS = MODEL_DIR / "yolov5" / "weights" / "best.pt"
+YOLOV5_WEIGHTS = MODEL_DIR / "yolov5" / "weights" /"weights2"/ "best.pt"
+#YOLOV5_WEIGHTS = MODEL_DIR / "yolov5" / "weights" /"v8"/ "best.pt"
 CRNN_MODEL_PATH = MODEL_DIR / "crnn" / "user_data" / "model_data" / "best_model.pth"
 
 # 数据路径
 DATA_DIR = ROOT_DIR / "data"
-INPUT_DIR = DATA_DIR / "images" /"mchar_test_a_processed"
+INPUT_DIR = DATA_DIR / "images" /"mchar_test_a"
 OUTPUT_DIR = DATA_DIR / "output"
 
 # 模型参数
